@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-<meta name="color-scheme" content="dark" />
+<meta name="color-scheme" content="dark only" />
 <meta name="theme-color" content="#FF6600" />
 <meta name="supported-color-schemes" content="dark" />
 <title>Wheel of Fortune - Niqat | BIG5 Construct Egypt 2026</title>
@@ -222,31 +222,38 @@
     -webkit-appearance: none;
     appearance: none;
     -webkit-tap-highlight-color: transparent;
-    background-image: none;
     color: #FFFFFF;
+    forced-color-adjust: none;
   }
   .btn:active { transform: scale(0.98); }
   .btn-primary {
+    background: linear-gradient(180deg, #FF6600 0%, #FF6600 100%) !important;
     background-color: #FF6600 !important;
-    background-image: none !important;
     color: #FFFFFF !important;
+    forced-color-adjust: none !important;
   }
-  .btn-primary:hover { background-color: #E55A00 !important; }
+  .btn-primary:hover {
+    background: linear-gradient(180deg, #E55A00 0%, #E55A00 100%) !important;
+  }
   .btn-primary:disabled {
     opacity: 0.5;
     cursor: not-allowed;
-    background-color: #4a4a4a !important;
+    background: linear-gradient(180deg, #4a4a4a 0%, #4a4a4a 100%) !important;
   }
   .btn-secondary {
+    background: linear-gradient(180deg, #3a3a3a 0%, #3a3a3a 100%) !important;
     background-color: #3a3a3a !important;
-    background-image: none !important;
     color: #FFFFFF !important;
     border: 1px solid #4a4a4a;
   }
   .btn-danger {
+    background: linear-gradient(180deg, #e74c3c 0%, #e74c3c 100%) !important;
     background-color: #e74c3c !important;
-    background-image: none !important;
     color: #FFFFFF !important;
+  }
+  /* Prevent Chrome force-dark on orange elements */
+  @media (forced-colors: active), (prefers-color-scheme: light) {
+    .btn-primary { background: #FF6600 !important; background-color: #FF6600 !important; }
   }
 
   /* ============ TOAST ============ */
@@ -1145,28 +1152,64 @@ async function sendWhatsAppMessage(record) {
   }
 }
 
-// منع الإرسال المزدوج للواتس (race condition guard)
+// منع الإرسال المزدوج للواتس (DB-based lock + in-memory guard)
 const _waSendingNow = new Set();
+const WA_SEND_LOCK_TIMEOUT = 60000; // 60 seconds
 
 async function trySendWhatsAppForRecord(recordId) {
-  // Guard against concurrent sends for the same record
+  // In-memory guard (same tab race)
   if (_waSendingNow.has(recordId)) return;
   _waSendingNow.add(recordId);
   try {
     const rec = await dbGet(recordId);
     if (!rec || rec.waSent) return;
+
+    // DB-based lock (cross-tab/cross-device race)
+    if (rec.waSendingAt) {
+      const lockAge = Date.now() - new Date(rec.waSendingAt).getTime();
+      if (lockAge < WA_SEND_LOCK_TIMEOUT) {
+        // Another instance is sending or recently sent - skip
+        return;
+      }
+      // Lock is stale (>60s old) - safe to retry
+    }
+
+    // Acquire lock
+    rec.waSendingAt = new Date().toISOString();
+    await dbUpdate(rec);
+
+    // Send the message
     const result = await sendWhatsAppMessage(rec);
-    // Re-fetch the record to avoid overwriting other concurrent updates
+
+    // Re-fetch to avoid overwriting other concurrent updates
     const fresh = await dbGet(recordId);
-    if (!fresh || fresh.waSent) return;
+    if (!fresh) return;
+
     if (result.success) {
       fresh.waSent = true;
       fresh.waSentAt = new Date().toISOString();
+      fresh.waSendingAt = null;
       await dbUpdate(fresh);
-    } else if (!result.skipped) {
+    } else if (result.skipped) {
+      // Release lock for retry later
+      fresh.waSendingAt = null;
+      await dbUpdate(fresh);
+    } else {
+      // Failed - release lock and store error
       fresh.waLastError = result.error || `status ${result.status}`;
+      fresh.waSendingAt = null;
       await dbUpdate(fresh);
     }
+  } catch (err) {
+    console.error("trySendWhatsAppForRecord error:", err);
+    // Try to release lock on error
+    try {
+      const fresh = await dbGet(recordId);
+      if (fresh && !fresh.waSent) {
+        fresh.waSendingAt = null;
+        await dbUpdate(fresh);
+      }
+    } catch (e) {}
   } finally {
     _waSendingNow.delete(recordId);
   }
@@ -1177,7 +1220,16 @@ async function sendPendingWhatsApp() {
   if (!Settings.waEnabled || !Settings.waApiUrl) return;
   if (!navigator.onLine) return;
   const all = await dbGetAll();
-  const pending = all.filter(r => r.whatsapp && !r.waSent);
+  const now = Date.now();
+  const pending = all.filter(r => {
+    if (!r.whatsapp || r.waSent) return false;
+    // Skip if another device/tab has an active lock (< 60s old)
+    if (r.waSendingAt) {
+      const lockAge = now - new Date(r.waSendingAt).getTime();
+      if (lockAge < WA_SEND_LOCK_TIMEOUT) return false;
+    }
+    return true;
+  });
   for (const rec of pending) {
     await trySendWhatsAppForRecord(rec.id);
   }
